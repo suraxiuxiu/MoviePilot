@@ -96,20 +96,21 @@ class MediaChain(ChainBase):
         """
         mediainfo = None
         plugin_available = eventmanager.check(ChainEventType.NameRecognize)
-        if settings.RECOGNIZE_PLUGIN_FIRST and plugin_available:
-            # 插件优先
-            logger.info(f"插件优先模式已开启。请求辅助识别，标题：{log_name} ...")
+        agent_available = bool(settings.AI_AGENT_ENABLE)
+        if settings.RECOGNIZE_PLUGIN_FIRST and (plugin_available or agent_available):
+            # 插件/Agent优先
+            logger.info(f"辅助识别优先模式已开启。请求辅助识别，标题：{log_name} ...")
             mediainfo = plugin_fn()
             if not mediainfo:
                 logger.info(f'辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别')
                 mediainfo = native_fn()
         else:
             # 原生优先
-            logger.info(f"插件优先模式未开启。尝试原生识别，标题：{log_name} ...")
+            logger.info(f"尝试原生识别，标题：{log_name} ...")
             mediainfo = native_fn()
-            if not mediainfo and plugin_available:
+            if not mediainfo and (plugin_available or agent_available):
                 logger.info(f'原生识别未识别到 {log_context} 的媒体信息，尝试使用辅助识别')
-                mediainfo = plugin_fn()    
+                mediainfo = plugin_fn()
         return mediainfo
 
     def recognize_by_meta(self, metainfo: MetaBase, episode_group: Optional[str] = None) -> Optional[MediaInfo]:
@@ -136,27 +137,34 @@ class MediaChain(ChainBase):
 
     def recognize_help(self, title: str, org_meta: MetaBase) -> Optional[MediaInfo]:
         """
-        请求辅助识别，返回媒体信息
+        请求辅助识别，返回媒体信息：
+        - 有插件（ChatGPT等）→ 走 NameRecognize 事件
+        - 无插件且开启 Agent  → 直接调 agent_manager
         :param title: 标题
         :param org_meta: 原始元数据
         """
-        # 发送请求事件，等待结果
-        result: Event = eventmanager.send_event(
-            ChainEventType.NameRecognize,
-            {
-                'title': title,
-            }
-        )
-        if not result:
-            # 无插件处理识别事件，尝试使用系统LLM辅助识别
-            if not settings.AI_AGENT_ENABLE:
-                return None
-            logger.info(f'无辅助识别插件，尝试使用系统Agent识别：{title} ...')
+        plugin_available = eventmanager.check(ChainEventType.NameRecognize)
+        event_data: dict = {}
+        if plugin_available:
+            # 有插件，走事件机制
+            result: Event = eventmanager.send_event(
+                ChainEventType.NameRecognize,
+                {'title': title},
+            )
+            event_data = (result.event_data or {}) if result else {}
+        elif settings.AI_AGENT_ENABLE:
+            # 无插件，直接用系统 Agent
+            logger.info(f'原生识别失败，使用系统Agent辅助识别：{title} ...')
             from app.agent import agent_manager
-            event_data = agent_manager.recognize_name(title) or {}
+            _recognize_prompt = (
+                f'解析以下文件名并返回JSON：'
+                f'格式：{{"name":string,"version":string,"part":string,"year":string,'
+                f'"resolution":string,"season":number|null,"episode":number|null}}\n\n'
+                f'文件名：{title}  只允许输出JSON。'
+            )
+            event_data = agent_manager.recognize_name(title, prompt=_recognize_prompt) or {}
         else:
-            # 获取返回事件数据
-            event_data = result.event_data or {}
+            return None
         logger.info(f'获取到辅助识别结果：{event_data}')
         # 处理数据格式
         title, year, season_number, episode_number = None, None, None, None
@@ -179,6 +187,11 @@ class MediaChain(ChainBase):
             logger.info(f'辅助识别与原始识别结果一致，无需重新识别媒体信息')
             return None
         logger.info(f'辅助识别结果与原始识别结果不一致，重新匹配媒体信息 ...')
+        # 保存原始解析状态（用于写入 TMDB 持久化缓存）
+        _orig_name = org_meta.name
+        _orig_year = org_meta.year
+        _orig_season = org_meta.begin_season
+        _orig_type = org_meta.type
         org_meta.name = title
         org_meta.year = year
         org_meta.begin_season = season_number
@@ -186,7 +199,31 @@ class MediaChain(ChainBase):
         if org_meta.begin_season is not None or org_meta.begin_episode is not None:
             org_meta.type = MediaType.TV
         # 重新识别
-        return self.recognize_media(meta=org_meta)
+        mediainfo = self.recognize_media(meta=org_meta)
+        # 将原始解析名写入 TMDB 持久化缓存，下次原生识别可直接命中
+        if mediainfo and mediainfo.tmdb_id:
+            try:
+                from app.modules.themoviedb.tmdb_cache import TmdbCache
+                _tmdb_cache = TmdbCache()
+                org_meta.name = _orig_name
+                org_meta.year = _orig_year
+                org_meta.begin_season = _orig_season
+                org_meta.type = _orig_type
+                _fake_info = {
+                    "id": mediainfo.tmdb_id,
+                    "media_type": mediainfo.type,
+                    "name": mediainfo.title,
+                    "title": mediainfo.title,
+                    "first_air_date": f"{mediainfo.year}-01-01" if mediainfo.year else None,
+                    "release_date": f"{mediainfo.year}-01-01" if mediainfo.year else None,
+                    "poster_path": getattr(mediainfo, 'poster_path', None),
+                    "backdrop_path": getattr(mediainfo, 'backdrop_path', None),
+                }
+                _tmdb_cache.update(org_meta, _fake_info)
+                logger.info(f"已将原始解析名写入TMDB持久化缓存：{_orig_name!r} → {mediainfo.title_year}")
+            except Exception as e:
+                logger.warning(f"写入TMDB缓存失败：{e}")
+        return mediainfo
 
     def recognize_by_path(self, path: str, episode_group: Optional[str] = None) -> Optional[Context]:
         """
@@ -864,20 +901,21 @@ class MediaChain(ChainBase):
         """
         mediainfo = None
         plugin_available = eventmanager.check(ChainEventType.NameRecognize)
-        if settings.RECOGNIZE_PLUGIN_FIRST and plugin_available:
-            # 插件优先
-            logger.info(f"插件优先模式已开启。请求辅助识别，标题：{log_name} ...")
+        agent_available = bool(settings.AI_AGENT_ENABLE)
+        if settings.RECOGNIZE_PLUGIN_FIRST and (plugin_available or agent_available):
+            # 插件/Agent优先
+            logger.info(f"辅助识别优先模式已开启。请求辅助识别，标题：{log_name} ...")
             mediainfo = await plugin_fn()
             if not mediainfo:
                 logger.info(f'辅助识别未识别到 {log_context} 的媒体信息，尝试使用原生识别')
                 mediainfo = await native_fn()
         else:
             # 原生优先
-            logger.info(f"插件优先模式未开启。尝试原生识别，标题：{log_name} ...")
+            logger.info(f"尝试原生识别，标题：{log_name} ...")
             mediainfo = await native_fn()
-            if not mediainfo and plugin_available:
+            if not mediainfo and (plugin_available or agent_available):
                 logger.info(f'原生识别未识别到 {log_context} 的媒体信息，尝试使用辅助识别')
-                mediainfo = await plugin_fn()    
+                mediainfo = await plugin_fn()
         return mediainfo
     
     async def async_recognize_by_meta(self, metainfo: MetaBase,
@@ -910,27 +948,34 @@ class MediaChain(ChainBase):
 
     async def async_recognize_help(self, title: str, org_meta: MetaBase) -> Optional[MediaInfo]:
         """
-        请求辅助识别，返回媒体信息（异步版本）
+        请求辅助识别，返回媒体信息（异步版本）：
+        - 有插件（ChatGPT等）→ 走 NameRecognize 事件
+        - 无插件且开启 Agent  → 直接调 agent_manager
         :param title: 标题
         :param org_meta: 原始元数据
         """
-        # 发送请求事件，等待结果
-        result: Event = await eventmanager.async_send_event(
-            ChainEventType.NameRecognize,
-            {
-                'title': title,
-            }
-        )
-        if not result:
-            # 无插件处理识别事件，尝试使用系统LLM辅助识别
-            if not settings.AI_AGENT_ENABLE:
-                return None
-            logger.info(f'无辅助识别插件，尝试使用系统Agent识别：{title} ...')
+        plugin_available = eventmanager.check(ChainEventType.NameRecognize)
+        event_data: dict = {}
+        if plugin_available:
+            # 有插件，走事件机制
+            result: Event = await eventmanager.async_send_event(
+                ChainEventType.NameRecognize,
+                {'title': title},
+            )
+            event_data = (result.event_data or {}) if result else {}
+        elif settings.AI_AGENT_ENABLE:
+            # 无插件，直接用系统 Agent
+            logger.info(f'原生识别失败，使用系统Agent辅助识别：{title} ...')
             from app.agent import agent_manager
-            event_data = await agent_manager.async_recognize_name(title) or {}
+            _recognize_prompt = (
+                f'解析以下文件名并返回JSON：'
+                f'格式：{{"name":string,"version":string,"part":string,"year":string,'
+                f'"resolution":string,"season":number|null,"episode":number|null}}\n\n'
+                f'文件名：{title}  只允许输出JSON。'
+            )
+            event_data = await agent_manager.async_recognize_name(title, prompt=_recognize_prompt) or {}
         else:
-            # 获取返回事件数据
-            event_data = result.event_data or {}
+            return None
         logger.info(f'获取到辅助识别结果：{event_data}')
         # 处理数据格式
         title, year, season_number, episode_number = None, None, None, None
@@ -953,6 +998,11 @@ class MediaChain(ChainBase):
             logger.info(f'辅助识别与原始识别结果一致，无需重新识别媒体信息')
             return None
         logger.info(f'辅助识别结果与原始识别结果不一致，重新匹配媒体信息 ...')
+        # 保存原始解析状态（用于写入 TMDB 持久化缓存）
+        _orig_name = org_meta.name
+        _orig_year = org_meta.year
+        _orig_season = org_meta.begin_season
+        _orig_type = org_meta.type
         org_meta.name = title
         org_meta.year = year
         org_meta.begin_season = season_number
@@ -960,7 +1010,31 @@ class MediaChain(ChainBase):
         if org_meta.begin_season or org_meta.begin_episode:
             org_meta.type = MediaType.TV
         # 重新识别
-        return await self.async_recognize_media(meta=org_meta)
+        mediainfo = await self.async_recognize_media(meta=org_meta)
+        # 将原始解析名写入 TMDB 持久化缓存，下次原生识别可直接命中
+        if mediainfo and mediainfo.tmdb_id:
+            try:
+                from app.modules.themoviedb.tmdb_cache import TmdbCache
+                _tmdb_cache = TmdbCache()
+                org_meta.name = _orig_name
+                org_meta.year = _orig_year
+                org_meta.begin_season = _orig_season
+                org_meta.type = _orig_type
+                _fake_info = {
+                    "id": mediainfo.tmdb_id,
+                    "media_type": mediainfo.type,
+                    "name": mediainfo.title,
+                    "title": mediainfo.title,
+                    "first_air_date": f"{mediainfo.year}-01-01" if mediainfo.year else None,
+                    "release_date": f"{mediainfo.year}-01-01" if mediainfo.year else None,
+                    "poster_path": getattr(mediainfo, 'poster_path', None),
+                    "backdrop_path": getattr(mediainfo, 'backdrop_path', None),
+                }
+                _tmdb_cache.update(org_meta, _fake_info)
+                logger.info(f"已将原始解析名写入TMDB持久化缓存：{_orig_name!r} → {mediainfo.title_year}")
+            except Exception as e:
+                logger.warning(f"写入TMDB缓存失败：{e}")
+        return mediainfo
 
     async def async_recognize_by_path(self, path: str, episode_group: Optional[str] = None) -> Optional[Context]:
         """

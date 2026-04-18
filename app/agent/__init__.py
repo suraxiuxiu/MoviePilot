@@ -6,6 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+from pydantic import BaseModel, Field
+
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
     SummarizationMiddleware,
@@ -901,68 +903,178 @@ class AgentManager:
         except Exception as e:
             logger.error(f"智能体心跳唤醒失败: {e}")
 
-    # 与 ChatGPT 插件一致的识别提示词
+    class _MediaNameSchema(BaseModel):
+        """LLM结构化输出Schema，用于强制约束媒体名称识别的返回格式"""
+        name: str = Field(description="电影或电视剧的名称，若存在谐音字或字母替代请还原")
+        version: Optional[str] = Field(default=None, description="版本信息，如蓝光、HDR等")
+        part: Optional[str] = Field(default=None, description="分段信息，如Part1/Part2")
+        year: Optional[str] = Field(default=None, description="年份")
+        resolution: Optional[str] = Field(default=None, description="分辨率，如1080p/4K")
+        season: Optional[int] = Field(default=None, description="季数，仅数字，无则为null")
+        episode: Optional[int] = Field(default=None, description="集数，仅数字，无则为null")
+
     _NAME_RECOGNIZE_PROMPT: str = (
+        '你是一个专业的影视文件名解析助手。'
+        '接下来我会给你一个电影或电视剧的文件名（或种子名），'
+        '请识别其中的媒体名称、版本、分段、年份、分辨率、季数、集数等信息。'
+        '如果中文作品的文件名中存在谐音字或字母替代的情况，请还原最有可能的结果。'
+        '请直接返回识别结果，不要解释或说明。'
+    )
+
+    # 降级 fallback 提示词：强制要求纯 JSON 输出
+    _NAME_RECOGNIZE_FALLBACK_PROMPT: str = (
         '接下来我会给你一个电影或电视剧的文件名，你需要识别文件名中的名称、版本、分段、年份、'
-        '分辨率、季集等信息，并按以下JSON格式返回：'
+        '分辨率、季集等信息，并按以下JSON格式返回：\n'
         '{"name":string,"version":string,"part":string,"year":string,"resolution":string,'
-        '"season":number|null,"episode":number|null}，'
-        '特别注意返回结果需要严格符合JSON格式，不需要有任何其它的字符。'
-        '如果中文电影或电视剧的文件名中存在谐音字或字母替代的情况，请还原最有可能的结果。'
+        '"season":number|null,"episode":number|null}\n'
+        '特别注意：\n'
+        '1. 返回结果必须且只能是合法JSON，不要有任何其他字符、解释或Markdown格式。\n'
+        '2. 如果中文作品存在谐音字或字母替代，请还原最有可能的名称。\n'
+        '3. 不要返回表格、分析或任何说明文字，只返回JSON对象本身。'
     )
 
     @staticmethod
-    def _parse_name_response(content: str) -> Optional[dict]:
-        """解析LLM识别响应，兼容 ```json``` 包裹格式"""
+    def _parse_name_json(content: str) -> Optional[dict]:
+        """从文本中提取 JSON，兼容 ```json``` 包裹及混杂文字的情况"""
         import json
         import re
         content = content.strip()
-        match = re.match(r'^```(?:json)?\s*([\s\S]*?)\s*```$', content)
+        # 尝试剥离 ```json ... ``` 包裹
+        match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', content)
         if match:
             content = match.group(1)
+        # 尝试直接解析
         try:
             return json.loads(content)
         except Exception:
-            return None
+            pass
+        # 尝试从文本中提取第一个 JSON 对象
+        match = re.search(r'\{[\s\S]*\}', content)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+        return None
 
-    def recognize_name(self, title: str) -> Optional[dict]:
-        """
-        使用系统LLM识别文件名/种子名中的媒体要素（同步）。
-        由识别链在无插件可用时调用，返回 {name, year, season, episode} 字典。
-        """
+    def _call_structured(self, llm, title: str) -> Optional[dict]:
+        """用 with_structured_output 调用 LLM（同步），失败返回 None"""
+        from langchain_core.messages import SystemMessage, HumanMessage
         try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            llm = LLMHelper.get_llm(streaming=False)
-            response = llm.invoke([
+            structured_llm = llm.with_structured_output(self._MediaNameSchema)
+            result = structured_llm.invoke([
                 SystemMessage(content=self._NAME_RECOGNIZE_PROMPT),
                 HumanMessage(content=title),
             ])
-            result = self._parse_name_response(response.content)
-            if result and result.get("name"):
-                logger.info(f"Agent辅助识别成功：{title} → {result}")
-                return result
+            return result.model_dump() if result else None
+        except Exception as e:
+            logger.warning(f"Agent structured_output 解析失败，降级为 JSON 提示词：{e}")
+            return None
+
+    async def _call_structured_async(self, llm, title: str) -> Optional[dict]:
+        """用 with_structured_output 调用 LLM（异步），失败返回 None"""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        try:
+            structured_llm = llm.with_structured_output(self._MediaNameSchema)
+            result = await structured_llm.ainvoke([
+                SystemMessage(content=self._NAME_RECOGNIZE_PROMPT),
+                HumanMessage(content=title),
+            ])
+            return result.model_dump() if result else None
+        except Exception as e:
+            logger.warning(f"Agent structured_output 解析失败，降级为 JSON 提示词：{e}")
+            return None
+
+    def _call_fallback(self, llm, title: str) -> Optional[dict]:
+        """降级方案：用强制 JSON 提示词直接调用（同步）"""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        response = llm.invoke([
+            SystemMessage(content=self._NAME_RECOGNIZE_FALLBACK_PROMPT),
+            HumanMessage(content=title),
+        ])
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"Agent降级识别原始返回：{content!r}")
+        return self._parse_name_json(content)
+
+    async def _call_fallback_async(self, llm, title: str) -> Optional[dict]:
+        """降级方案：用强制 JSON 提示词直接调用（异步）"""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        response = await llm.ainvoke([
+            SystemMessage(content=self._NAME_RECOGNIZE_FALLBACK_PROMPT),
+            HumanMessage(content=title),
+        ])
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"Agent降级识别原始返回：{content!r}")
+        return self._parse_name_json(content)
+
+    def _call_raw_prompt(self, llm, prompt: str) -> Optional[dict]:
+        """直接将调用方提供的完整提示词作为 HumanMessage 发给 LLM（同步）"""
+        from langchain_core.messages import HumanMessage
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"Agent降级识别原始返回：{content!r}")
+        return self._parse_name_json(content)
+
+    async def _call_raw_prompt_async(self, llm, prompt: str) -> Optional[dict]:
+        """直接将调用方提供的完整提示词作为 HumanMessage 发给 LLM（异步）"""
+        from langchain_core.messages import HumanMessage
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"Agent降级识别原始返回：{content!r}")
+        return self._parse_name_json(content)
+
+    def recognize_name(self, title: str, prompt: Optional[str] = None) -> Optional[dict]:
+        """
+        使用系统LLM识别文件名/种子名中的媒体要素（同步）。
+        优先用 with_structured_output 强制约束输出，失败时降级为 JSON 提示词模式。
+        :param title: 文件名/种子名
+        :param prompt: 调用方自定义的完整提示词（含格式说明和文件名）；提供时跳过结构化输出直接发送给 LLM
+        由识别链在无插件可用时调用，返回 {name, year, season, episode} 字典。
+        """
+        try:
+            llm = LLMHelper.get_llm(streaming=False)
+            if prompt:
+                # 使用调用方提供的完整提示词，直接发给 LLM
+                result_dict = self._call_raw_prompt(llm, prompt)
+            else:
+                # 优先：结构化输出（function calling）
+                result_dict = self._call_structured(llm, title)
+                # 降级：强制 JSON 提示词
+                if not result_dict:
+                    result_dict = self._call_fallback(llm, title)
+            logger.info(f"Agent辅助识别原始返回：{result_dict}")
+            if result_dict and result_dict.get("name"):
+                logger.info(f"Agent辅助识别成功：{title} → {result_dict}")
+                return result_dict
             logger.warning(f"Agent辅助识别未返回有效结果：{title}")
             return None
         except Exception as e:
             logger.error(f"Agent辅助识别失败：{e}")
             return None
 
-    async def async_recognize_name(self, title: str) -> Optional[dict]:
+    async def async_recognize_name(self, title: str, prompt: Optional[str] = None) -> Optional[dict]:
         """
         使用系统LLM识别文件名/种子名中的媒体要素（异步）。
+        优先用 with_structured_output 强制约束输出，失败时降级为 JSON 提示词模式。
+        :param title: 文件名/种子名
+        :param prompt: 调用方自定义的完整提示词（含格式说明和文件名）；提供时跳过结构化输出直接发送给 LLM
         由识别链在无插件可用时调用，返回 {name, year, season, episode} 字典。
         """
         try:
-            from langchain_core.messages import SystemMessage, HumanMessage
             llm = LLMHelper.get_llm(streaming=False)
-            response = await llm.ainvoke([
-                SystemMessage(content=self._NAME_RECOGNIZE_PROMPT),
-                HumanMessage(content=title),
-            ])
-            result = self._parse_name_response(response.content)
-            if result and result.get("name"):
-                logger.info(f"Agent辅助识别成功：{title} → {result}")
-                return result
+            if prompt:
+                # 使用调用方提供的完整提示词，直接发给 LLM
+                result_dict = await self._call_raw_prompt_async(llm, prompt)
+            else:
+                # 优先：结构化输出（function calling）
+                result_dict = await self._call_structured_async(llm, title)
+                # 降级：强制 JSON 提示词
+                if not result_dict:
+                    result_dict = await self._call_fallback_async(llm, title)
+            logger.info(f"Agent辅助识别原始返回：{result_dict}")
+            if result_dict and result_dict.get("name"):
+                logger.info(f"Agent辅助识别成功：{title} → {result_dict}")
+                return result_dict
             logger.warning(f"Agent辅助识别未返回有效结果：{title}")
             return None
         except Exception as e:
