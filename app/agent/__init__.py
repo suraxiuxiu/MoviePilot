@@ -901,6 +901,74 @@ class AgentManager:
         except Exception as e:
             logger.error(f"智能体心跳唤醒失败: {e}")
 
+    # 与 ChatGPT 插件一致的识别提示词
+    _NAME_RECOGNIZE_PROMPT: str = (
+        '接下来我会给你一个电影或电视剧的文件名，你需要识别文件名中的名称、版本、分段、年份、'
+        '分辨率、季集等信息，并按以下JSON格式返回：'
+        '{"name":string,"version":string,"part":string,"year":string,"resolution":string,'
+        '"season":number|null,"episode":number|null}，'
+        '特别注意返回结果需要严格符合JSON格式，不需要有任何其它的字符。'
+        '如果中文电影或电视剧的文件名中存在谐音字或字母替代的情况，请还原最有可能的结果。'
+    )
+
+    @staticmethod
+    def _parse_name_response(content: str) -> Optional[dict]:
+        """解析LLM识别响应，兼容 ```json``` 包裹格式"""
+        import json
+        import re
+        content = content.strip()
+        match = re.match(r'^```(?:json)?\s*([\s\S]*?)\s*```$', content)
+        if match:
+            content = match.group(1)
+        try:
+            return json.loads(content)
+        except Exception:
+            return None
+
+    def recognize_name(self, title: str) -> Optional[dict]:
+        """
+        使用系统LLM识别文件名/种子名中的媒体要素（同步）。
+        由识别链在无插件可用时调用，返回 {name, year, season, episode} 字典。
+        """
+        try:
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = LLMHelper.get_llm(streaming=False)
+            response = llm.invoke([
+                SystemMessage(content=self._NAME_RECOGNIZE_PROMPT),
+                HumanMessage(content=title),
+            ])
+            result = self._parse_name_response(response.content)
+            if result and result.get("name"):
+                logger.info(f"Agent辅助识别成功：{title} → {result}")
+                return result
+            logger.warning(f"Agent辅助识别未返回有效结果：{title}")
+            return None
+        except Exception as e:
+            logger.error(f"Agent辅助识别失败：{e}")
+            return None
+
+    async def async_recognize_name(self, title: str) -> Optional[dict]:
+        """
+        使用系统LLM识别文件名/种子名中的媒体要素（异步）。
+        由识别链在无插件可用时调用，返回 {name, year, season, episode} 字典。
+        """
+        try:
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = LLMHelper.get_llm(streaming=False)
+            response = await llm.ainvoke([
+                SystemMessage(content=self._NAME_RECOGNIZE_PROMPT),
+                HumanMessage(content=title),
+            ])
+            result = self._parse_name_response(response.content)
+            if result and result.get("name"):
+                logger.info(f"Agent辅助识别成功：{title} → {result}")
+                return result
+            logger.warning(f"Agent辅助识别未返回有效结果：{title}")
+            return None
+        except Exception as e:
+            logger.error(f"Agent辅助识别失败：{e}")
+            return None
+
     async def retry_failed_transfer(self, history_id: int, group_key: str = ""):
         """
         触发智能体重新整理失败的历史记录。
